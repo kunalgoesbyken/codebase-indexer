@@ -1,0 +1,25 @@
+[package]
+name = "codebase-indexer"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+sha2 = "0.10"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-python = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-cpp = "0.23"
+tokenizers = "0.21"
+anyhow = "1"
+rand = "0.8"
+ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
+ndarray = "0.17"
+tantivy = "0.22"

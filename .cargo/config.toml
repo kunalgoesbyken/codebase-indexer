@@ -1,0 +1,9 @@
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=-crt-static", "-C", "link-arg=/NODEFAULTLIB:LIBCMT", "-C", "link-arg=/NODEFAULTLIB:LIBCMTD"]
+
+[env]
+CFLAGS_x86_64_pc_windows_msvc = "/MD"
+CXXFLAGS_x86_64_pc_windows_msvc = "/MD"
