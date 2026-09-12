@@ -151,3 +151,171 @@ impl VectorStore {
         scored
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Chunk;
+    use std::path::PathBuf;
+
+    /// Unique scratch dir per test so parallel test threads never collide.
+    fn scratch(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "codebase-indexer-test-{name}-{}-{nanos}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn record(file_path: &str, start_line: usize, text: &str) -> IndexRecord {
+        IndexRecord {
+            chunk: Chunk {
+                file_path: file_path.to_string(),
+                start_line,
+                end_line: start_line + 2,
+                text: text.to_string(),
+            },
+            // Fake embedding; no ONNX model involved.
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+        }
+    }
+
+    fn texts(store: &VectorStore) -> Vec<String> {
+        store
+            .records()
+            .iter()
+            .map(|r| r.chunk.text.clone())
+            .collect()
+    }
+
+    /// Regression test for BUG 1: `cmd_index` used to append a changed file's new
+    /// chunks without ever removing its previous chunks, so the append-only log
+    /// accumulated stale records forever and searches returned deleted symbols.
+    ///
+    /// Asserts the tombstone-then-append sequence the fix relies on leaves only
+    /// the new records, both in memory and after replaying the log from disk.
+    #[test]
+    fn tombstone_then_append_keeps_only_new_records() {
+        let dir = scratch("tombstone");
+        let vectors_path = dir.join("vectors.bin");
+
+        let mut store = VectorStore::new(&vectors_path).expect("new store");
+        store
+            .append(vec![
+                record("a.rs", 1, "alpha_unique_marker_one"),
+                record("a.rs", 9, "alpha_second_stale_chunk"),
+                record("b.rs", 1, "other_file_untouched"),
+            ])
+            .expect("initial append");
+        assert_eq!(store.records().len(), 3);
+
+        // The fix: drop the file's prior chunks, then append the new ones.
+        store.tombstone("a.rs").expect("tombstone");
+        store
+            .append(vec![record("a.rs", 1, "beta_unique_marker_two")])
+            .expect("re-append");
+
+        // In-memory state: only the new a.rs chunk plus untouched b.rs.
+        let mut in_memory = texts(&store);
+        in_memory.sort();
+        assert_eq!(
+            in_memory,
+            vec!["beta_unique_marker_two", "other_file_untouched"],
+            "stale records survived in memory"
+        );
+        assert!(
+            !texts(&store)
+                .iter()
+                .any(|t| t.contains("alpha_unique_marker_one")),
+            "the stale symbol is still searchable in memory"
+        );
+
+        // On-disk persistence: re-open and verify read_log replays the tombstone.
+        let reopened = VectorStore::new(&vectors_path).expect("reopen store");
+        let mut on_disk = texts(&reopened);
+        on_disk.sort();
+        assert_eq!(
+            on_disk,
+            vec!["beta_unique_marker_two", "other_file_untouched"],
+            "tombstone was not replayed when reading the log from disk"
+        );
+
+        // The log itself is append-only, so the stale bytes are still present;
+        // what matters is that replay excludes them from the live record set.
+        let raw = std::fs::read(&vectors_path).expect("read log");
+        assert!(
+            raw.windows(23)
+                .any(|w| w == b"alpha_unique_marker_one"),
+            "sanity check: the log should still physically contain the stale bytes"
+        );
+        assert_eq!(
+            reopened
+                .records()
+                .iter()
+                .filter(|r| r.chunk.file_path == "a.rs")
+                .count(),
+            1,
+            "a.rs should have exactly one live chunk after tombstone + re-append"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tombstone must be durable on its own: appending nothing afterwards still
+    /// leaves the file purged once the log is replayed from disk. This is the case
+    /// BUG 2 depends on (a file deleted from disk is tombstoned and never re-added).
+    #[test]
+    fn tombstone_alone_persists_across_reopen() {
+        let dir = scratch("purge");
+        let vectors_path = dir.join("vectors.bin");
+
+        let mut store = VectorStore::new(&vectors_path).expect("new store");
+        store
+            .append(vec![
+                record("gone.rs", 1, "gone_unique_marker"),
+                record("kept.rs", 1, "kept_unique_marker"),
+            ])
+            .expect("append");
+
+        store.tombstone("gone.rs").expect("tombstone");
+        assert_eq!(texts(&store), vec!["kept_unique_marker"]);
+
+        let reopened = VectorStore::new(&vectors_path).expect("reopen store");
+        assert_eq!(
+            texts(&reopened),
+            vec!["kept_unique_marker"],
+            "purged file came back after reopening the log"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tombstoning a path that was never indexed must be a harmless no-op, since
+    /// the index loop tombstones every changed file unconditionally.
+    #[test]
+    fn tombstone_unknown_path_is_noop() {
+        let dir = scratch("noop");
+        let vectors_path = dir.join("vectors.bin");
+
+        let mut store = VectorStore::new(&vectors_path).expect("new store");
+        store
+            .append(vec![record("a.rs", 1, "only_chunk")])
+            .expect("append");
+        store.tombstone("never_indexed.rs").expect("tombstone");
+
+        assert_eq!(texts(&store), vec!["only_chunk"]);
+        let reopened = VectorStore::new(&vectors_path).expect("reopen store");
+        assert_eq!(texts(&reopened), vec!["only_chunk"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

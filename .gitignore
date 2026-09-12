@@ -1,3 +1,4 @@
 /target
 .indexer/
 models/model_int8.onnx
+.firecrawl/

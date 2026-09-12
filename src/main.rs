@@ -40,6 +40,13 @@ fn main() -> Result<()> {
     }
 }
 
+fn rel_path(path: &std::path::Path, root: &std::path::Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
 fn cmd_index(root: PathBuf) -> Result<()> {
     let index_dir = root.join(".indexer");
     let cache_path = index_dir.join("cache.bin");
@@ -49,22 +56,37 @@ fn cmd_index(root: PathBuf) -> Result<()> {
 
     println!("Scanning {}...", root.display());
     let files = walker::walk_source_files(&root)?;
-    if files.is_empty() {
-        println!("No source files found.");
-        return Ok(());
-    }
     println!("Found {} source files", files.len());
 
     let cache = delta::load_cache(&cache_path)?;
+
+    // Relative paths of everything currently on disk, in the exact same form
+    // used as cache keys (strip_prefix + to_string_lossy).
+    let walked_rels: std::collections::HashSet<String> =
+        files.iter().map(|p| rel_path(p, &root)).collect();
+
+    // BUG 2: files present in the cache but no longer on disk must be purged
+    // from BOTH the vector store and the BM25 index.
+    let mut deleted: Vec<String> = cache
+        .keys()
+        .filter(|rel| !walked_rels.contains(*rel))
+        .cloned()
+        .collect();
+    deleted.sort();
+
     let changed = delta::detect_changes(&files, &cache, &root)?;
     println!("{} files modified/new", changed.len());
+    if !deleted.is_empty() {
+        println!("{} files deleted from disk", deleted.len());
+    }
 
-    if changed.is_empty() {
+    if changed.is_empty() && deleted.is_empty() {
         println!("Nothing to index.");
         return Ok(());
     }
 
-    let mut embedder = embedder::Embedder::new(&model_dir)?;
+    // Store and BM25 are opened before the embedder so that a purge-only run
+    // (deletions but no new/modified files) does not require the ONNX model.
     let mut store = store::VectorStore::new(&vectors_path)?;
 
     let bm25_exists = bm25_dir.exists();
@@ -74,43 +96,86 @@ fn cmd_index(root: PathBuf) -> Result<()> {
         bm25::Bm25Index::new(&bm25_dir)?
     };
 
+    for rel in &deleted {
+        println!("  Purging deleted {}...", rel);
+        if let Err(e) = store.tombstone(rel) {
+            eprintln!("  Vector tombstone failed for {}: {e}", rel);
+        }
+        if let Err(e) = bm25.delete_file(rel) {
+            eprintln!("  BM25 delete failed for {}: {e}", rel);
+        }
+    }
+
+    // Relative paths that are safe to record in the cache: either indexed
+    // successfully this run, or parsed successfully with genuinely no chunks.
+    let mut indexed_ok: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut total_chunks = 0;
 
-    for path in &changed {
-        println!("  Processing {}...", path.display());
-        let rel = path
-            .strip_prefix(&root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
-        let source = std::fs::read_to_string(path)?;
-        let chunks = chunker::chunk_file_with_rel(path, &source, &rel)?;
-        println!("    -> {} chunks", chunks.len());
+    if !changed.is_empty() {
+        let mut embedder = embedder::Embedder::new(&model_dir)?;
 
-        if chunks.is_empty() {
-            continue;
-        }
+        for path in &changed {
+            println!("  Processing {}...", path.display());
+            let rel = rel_path(path, &root);
+            let source = match std::fs::read_to_string(path) {
+                Ok(source) => source,
+                Err(e) => {
+                    // Not cached: the next run must retry this file.
+                    eprintln!("  Read failed for {}: {e}", path.display());
+                    continue;
+                }
+            };
+            let chunks = match chunker::chunk_file_with_rel(path, &source, &rel) {
+                Ok(chunks) => chunks,
+                Err(e) => {
+                    eprintln!("  Chunking failed for {}: {e}", path.display());
+                    continue;
+                }
+            };
+            println!("    -> {} chunks", chunks.len());
 
-        match embedder.embed(&chunks) {
-            Ok(embeddings) => {
+            if chunks.is_empty() {
+                // Parsed fine, genuinely nothing to index. Still drop any prior
+                // chunks for it, then cache it so we don't re-parse every run.
+                if let Err(e) = store.tombstone(&rel) {
+                    eprintln!("  Vector tombstone failed for {}: {e}", rel);
+                }
                 if let Err(e) = bm25.delete_file(&rel) {
                     eprintln!("  BM25 delete failed for {}: {e}", rel);
                 }
-                if let Err(e) = bm25.add_chunks(&chunks) {
-                    eprintln!("  BM25 index failed for {}: {e}", rel);
-                }
-                let records: Vec<types::IndexRecord> = chunks
-                    .into_iter()
-                    .zip(embeddings)
-                    .map(|(chunk, embedding)| types::IndexRecord { chunk, embedding })
-                    .collect();
-                let count = records.len();
-                store.append(records)?;
-                total_chunks += count;
-                println!("    -> embedded {count} chunks");
+                indexed_ok.insert(rel);
+                continue;
             }
-            Err(e) => {
-                eprintln!("  Embedding failed for {}: {e}", path.display());
+
+            match embedder.embed(&chunks) {
+                Ok(embeddings) => {
+                    // BUG 1: drop the file's prior chunks from the vector store,
+                    // symmetric with the BM25 delete, before appending new ones.
+                    if let Err(e) = store.tombstone(&rel) {
+                        eprintln!("  Vector tombstone failed for {}: {e}", rel);
+                    }
+                    if let Err(e) = bm25.delete_file(&rel) {
+                        eprintln!("  BM25 delete failed for {}: {e}", rel);
+                    }
+                    if let Err(e) = bm25.add_chunks(&chunks) {
+                        eprintln!("  BM25 index failed for {}: {e}", rel);
+                    }
+                    let records: Vec<types::IndexRecord> = chunks
+                        .into_iter()
+                        .zip(embeddings)
+                        .map(|(chunk, embedding)| types::IndexRecord { chunk, embedding })
+                        .collect();
+                    let count = records.len();
+                    store.append(records)?;
+                    total_chunks += count;
+                    indexed_ok.insert(rel);
+                    println!("    -> embedded {count} chunks");
+                }
+                Err(e) => {
+                    // BUG 3: leave `rel` out of `indexed_ok` so it is absent from
+                    // the new cache and gets retried on the next run.
+                    eprintln!("  Embedding failed for {}: {e}", path.display());
+                }
             }
         }
     }
@@ -119,28 +184,45 @@ fn cmd_index(root: PathBuf) -> Result<()> {
 
     println!("Wrote {total_chunks} chunks to vectors.bin (append-only log)");
 
-    let new_states: Vec<_> = files
-        .iter()
-        .map(|path| {
-            let rel = path
-                .strip_prefix(&root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
-            let hash = delta::file_hash(path).unwrap_or_default();
-            let modified = std::fs::metadata(path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            types::FileState {
-                path: rel,
-                hash,
-                last_modified: modified,
+    // BUG 3: the new cache holds only (a) files indexed successfully this run and
+    // (b) files that were already cached and are still unchanged on disk.
+    // Files that errored are omitted so the next run retries them, and deleted
+    // files drop out because they are not in `walked_rels`.
+    let changed_rels: std::collections::HashSet<String> =
+        changed.iter().map(|p| rel_path(p, &root)).collect();
+
+    let mut new_states: Vec<types::FileState> = Vec::new();
+    for path in &files {
+        let rel = rel_path(path, &root);
+        if !indexed_ok.contains(&rel) {
+            // Unchanged file: carry its existing cache entry forward untouched.
+            if !changed_rels.contains(&rel) {
+                if let Some(existing) = cache.get(&rel) {
+                    new_states.push(existing.clone());
+                }
             }
-        })
-        .collect();
+            // Otherwise it was attempted and failed -> omit it entirely.
+            continue;
+        }
+        let hash = match delta::file_hash(path) {
+            Ok(hash) => hash,
+            Err(e) => {
+                eprintln!("  Hashing failed for {}: {e}", rel);
+                continue;
+            }
+        };
+        let modified = std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        new_states.push(types::FileState {
+            path: rel,
+            hash,
+            last_modified: modified,
+        });
+    }
     delta::save_cache(&cache_path, &new_states)?;
     println!("Cache updated.");
 
