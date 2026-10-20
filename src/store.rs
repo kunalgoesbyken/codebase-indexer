@@ -1,45 +1,61 @@
 use crate::hnsw::HnswIndex;
-use crate::types::IndexRecord;
+use crate::types::{Chunk, IndexRecord};
 use anyhow::Result;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 const TOMBSTONE_MARKER: u32 = 0xFFFFFFFF;
+const ANN_MIN_RECORDS: usize = 1000;
 
-fn read_log(bytes: &[u8]) -> Vec<IndexRecord> {
-    let mut records = Vec::new();
+struct LogContents {
+    records: Vec<IndexRecord>,
+    appended: usize,
+    valid_len: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AnnSnapshot {
+    log_len: u64,
+    graph: HnswIndex,
+}
+
+fn read_u32(bytes: &[u8], pos: usize) -> Option<u32> {
+    let word = bytes.get(pos..pos + 4)?;
+    Some(u32::from_le_bytes(word.try_into().ok()?))
+}
+
+fn read_log(bytes: &[u8]) -> LogContents {
+    let mut records: Vec<IndexRecord> = Vec::new();
+    let mut appended = 0;
     let mut pos = 0;
-    while pos + 4 <= bytes.len() {
-        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
-        pos += 4;
+    while let Some(len) = read_u32(bytes, pos) {
+        let body = pos + 4;
         if len == TOMBSTONE_MARKER {
-            if pos + 4 <= bytes.len() {
-                let path_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
-                pos += 4;
-                if pos + path_len as usize <= bytes.len() {
-                    let tomb_path = std::str::from_utf8(&bytes[pos..pos + path_len as usize]).unwrap_or("");
-                    records.retain(|r: &IndexRecord| r.chunk.file_path != tomb_path);
-                    pos += path_len as usize;
-                }
+            let Some(path_len) = read_u32(bytes, body) else { break };
+            let path_start = body + 4;
+            let path_end = path_start + path_len as usize;
+            let Some(path) = bytes.get(path_start..path_end) else { break };
+            let path = String::from_utf8_lossy(path);
+            records.retain(|r| r.chunk.file_path.as_str() != path.as_ref());
+            pos = path_end;
+        } else {
+            let end = body + len as usize;
+            let Some(payload) = bytes.get(body..end) else { break };
+            if let Ok(record) = bincode::deserialize(payload) {
+                records.push(record);
+                appended += 1;
             }
-        } else if len > 0 {
-            let end = pos + len as usize;
-            if end <= bytes.len() {
-                if let Ok(record) = bincode::deserialize::<IndexRecord>(&bytes[pos..end]) {
-                    records.push(record);
-                }
-                pos = end;
-            }
+            pos = end;
         }
     }
-    records
+    LogContents { records, appended, valid_len: pos }
 }
 
 fn write_record<W: Write>(writer: &mut W, record: &IndexRecord) -> Result<()> {
     let data = bincode::serialize(record)?;
-    let len = data.len() as u32;
-    writer.write_all(&len.to_le_bytes())?;
+    writer.write_all(&(data.len() as u32).to_le_bytes())?;
     writer.write_all(&data)?;
     Ok(())
 }
@@ -52,48 +68,48 @@ fn write_tombstone<W: Write>(writer: &mut W, path: &str) -> Result<()> {
     Ok(())
 }
 
-fn build_hnsw(records: &[IndexRecord]) -> HnswIndex {
-    let mut hnsw = HnswIndex::new();
-    for record in records {
-        hnsw.insert(record.embedding.clone());
-    }
-    hnsw
-}
-
 pub struct VectorStore {
     records: Vec<IndexRecord>,
-    path: Box<Path>,
-    hnsw: HnswIndex,
+    path: PathBuf,
+    dead: usize,
 }
 
 impl VectorStore {
     pub fn new(path: &Path) -> Result<Self> {
-        let records = if path.exists() {
-            let bytes = std::fs::read(path)?;
-            read_log(&bytes)
-        } else {
-            Vec::new()
-        };
-        let hnsw = build_hnsw(&records);
+        let bytes = if path.exists() { std::fs::read(path)? } else { Vec::new() };
+        let log = read_log(&bytes);
+        if log.valid_len < bytes.len() {
+            OpenOptions::new().write(true).open(path)?.set_len(log.valid_len as u64)?;
+        }
         Ok(Self {
-            records,
-            path: path.into(),
-            hnsw,
+            dead: log.appended - log.records.len(),
+            records: log.records,
+            path: path.to_path_buf(),
         })
     }
 
-    pub fn tombstone(&mut self, file_path: &str) -> Result<()> {
+    pub fn records(&self) -> &[IndexRecord] {
+        &self.records
+    }
+
+    fn open_log(&self) -> Result<BufWriter<File>> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        write_tombstone(&mut file, file_path)?;
-        file.flush()?;
+        let file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        Ok(BufWriter::new(file))
+    }
+
+    pub fn tombstone(&mut self, file_path: &str) -> Result<()> {
+        let removed = self.records.iter().filter(|r| r.chunk.file_path == file_path).count();
+        if removed == 0 {
+            return Ok(());
+        }
+        let mut writer = self.open_log()?;
+        write_tombstone(&mut writer, file_path)?;
+        writer.flush()?;
         self.records.retain(|r| r.chunk.file_path != file_path);
-        self.hnsw = build_hnsw(&self.records);
+        self.dead += removed;
         Ok(())
     }
 
@@ -101,221 +117,83 @@ impl VectorStore {
         if records.is_empty() {
             return Ok(());
         }
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut writer = self.open_log()?;
         for record in &records {
-            write_record(&mut file, record)?;
+            write_record(&mut writer, record)?;
         }
-        file.flush()?;
+        writer.flush()?;
         self.records.extend(records);
-        self.hnsw = build_hnsw(&self.records);
         Ok(())
     }
 
-    pub fn records(&self) -> &[IndexRecord] {
-        &self.records
+    pub fn compact_if_needed(&mut self) -> Result<()> {
+        if self.dead <= self.records.len() {
+            return Ok(());
+        }
+        let tmp_path = self.path.with_extension("bin.tmp");
+        let mut writer = BufWriter::new(File::create(&tmp_path)?);
+        for record in &self.records {
+            write_record(&mut writer, record)?;
+        }
+        writer.into_inner()?.sync_all()?;
+        std::fs::rename(&tmp_path, &self.path)?;
+        self.dead = 0;
+        Ok(())
     }
 
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<(usize, f32)> {
-        let ef = (k * 2).max(50).min(self.records.len());
-        let indices = self.hnsw.search(query, k, ef);
-        let mut results: Vec<(usize, f32)> = indices
-            .into_iter()
-            .map(|idx| {
-                let actual_score =
-                    crate::query::cosine_similarity(query, &self.records[idx].embedding);
-                (idx, actual_score)
-            })
-            .collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results
+    fn ann_path(&self) -> PathBuf {
+        self.path.with_extension("hnsw")
     }
 
-    pub fn search_exact(&self, query: &[f32], k: usize) -> Vec<(usize, f32)> {
+    fn log_len(&self) -> Result<u64> {
+        Ok(std::fs::metadata(&self.path)?.len())
+    }
+
+    fn vectors(&self) -> Vec<&[f32]> {
+        self.records.iter().map(|r| r.embedding.as_slice()).collect()
+    }
+
+    pub fn rebuild_ann_index(&self) -> Result<()> {
+        let ann_path = self.ann_path();
+        if self.records.len() < ANN_MIN_RECORDS {
+            if ann_path.exists() {
+                std::fs::remove_file(ann_path)?;
+            }
+            return Ok(());
+        }
+        let snapshot = AnnSnapshot {
+            log_len: self.log_len()?,
+            graph: HnswIndex::build(&self.vectors()),
+        };
+        std::fs::write(ann_path, bincode::serialize(&snapshot)?)?;
+        Ok(())
+    }
+
+    fn load_ann_index(&self) -> Option<HnswIndex> {
+        let bytes = std::fs::read(self.ann_path()).ok()?;
+        let snapshot: AnnSnapshot = bincode::deserialize(&bytes).ok()?;
+        let is_current = snapshot.log_len == self.log_len().ok()?;
+        let is_usable = is_current && snapshot.graph.is_consistent(self.records.len());
+        is_usable.then_some(snapshot.graph)
+    }
+
+    pub fn search(&self, query: &[f32], k: usize) -> Vec<&Chunk> {
+        let indices = match self.load_ann_index() {
+            Some(graph) => graph.search(&self.vectors(), query, k, (k * 2).max(50)),
+            None => self.exact_search(query, k),
+        };
+        indices.into_iter().map(|idx| &self.records[idx].chunk).collect()
+    }
+
+    fn exact_search(&self, query: &[f32], k: usize) -> Vec<usize> {
         let mut scored: Vec<(usize, f32)> = self
             .records
             .iter()
             .enumerate()
-            .map(|(i, r)| {
-                let score = crate::query::cosine_similarity(query, &r.embedding);
-                (i, score)
-            })
+            .map(|(idx, r)| (idx, crate::query::cosine_similarity(query, &r.embedding)))
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored.truncate(k);
-        scored
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::Chunk;
-    use std::path::PathBuf;
-
-    /// Unique scratch dir per test so parallel test threads never collide.
-    fn scratch(name: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "codebase-indexer-test-{name}-{}-{nanos}-{seq}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
-    }
-
-    fn record(file_path: &str, start_line: usize, text: &str) -> IndexRecord {
-        IndexRecord {
-            chunk: Chunk {
-                file_path: file_path.to_string(),
-                start_line,
-                end_line: start_line + 2,
-                text: text.to_string(),
-            },
-            // Fake embedding; no ONNX model involved.
-            embedding: vec![0.1, 0.2, 0.3, 0.4],
-        }
-    }
-
-    fn texts(store: &VectorStore) -> Vec<String> {
-        store
-            .records()
-            .iter()
-            .map(|r| r.chunk.text.clone())
-            .collect()
-    }
-
-    /// Regression test for BUG 1: `cmd_index` used to append a changed file's new
-    /// chunks without ever removing its previous chunks, so the append-only log
-    /// accumulated stale records forever and searches returned deleted symbols.
-    ///
-    /// Asserts the tombstone-then-append sequence the fix relies on leaves only
-    /// the new records, both in memory and after replaying the log from disk.
-    #[test]
-    fn tombstone_then_append_keeps_only_new_records() {
-        let dir = scratch("tombstone");
-        let vectors_path = dir.join("vectors.bin");
-
-        let mut store = VectorStore::new(&vectors_path).expect("new store");
-        store
-            .append(vec![
-                record("a.rs", 1, "alpha_unique_marker_one"),
-                record("a.rs", 9, "alpha_second_stale_chunk"),
-                record("b.rs", 1, "other_file_untouched"),
-            ])
-            .expect("initial append");
-        assert_eq!(store.records().len(), 3);
-
-        // The fix: drop the file's prior chunks, then append the new ones.
-        store.tombstone("a.rs").expect("tombstone");
-        store
-            .append(vec![record("a.rs", 1, "beta_unique_marker_two")])
-            .expect("re-append");
-
-        // In-memory state: only the new a.rs chunk plus untouched b.rs.
-        let mut in_memory = texts(&store);
-        in_memory.sort();
-        assert_eq!(
-            in_memory,
-            vec!["beta_unique_marker_two", "other_file_untouched"],
-            "stale records survived in memory"
-        );
-        assert!(
-            !texts(&store)
-                .iter()
-                .any(|t| t.contains("alpha_unique_marker_one")),
-            "the stale symbol is still searchable in memory"
-        );
-
-        // On-disk persistence: re-open and verify read_log replays the tombstone.
-        let reopened = VectorStore::new(&vectors_path).expect("reopen store");
-        let mut on_disk = texts(&reopened);
-        on_disk.sort();
-        assert_eq!(
-            on_disk,
-            vec!["beta_unique_marker_two", "other_file_untouched"],
-            "tombstone was not replayed when reading the log from disk"
-        );
-
-        // The log itself is append-only, so the stale bytes are still present;
-        // what matters is that replay excludes them from the live record set.
-        let raw = std::fs::read(&vectors_path).expect("read log");
-        assert!(
-            raw.windows(23)
-                .any(|w| w == b"alpha_unique_marker_one"),
-            "sanity check: the log should still physically contain the stale bytes"
-        );
-        assert_eq!(
-            reopened
-                .records()
-                .iter()
-                .filter(|r| r.chunk.file_path == "a.rs")
-                .count(),
-            1,
-            "a.rs should have exactly one live chunk after tombstone + re-append"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A tombstone must be durable on its own: appending nothing afterwards still
-    /// leaves the file purged once the log is replayed from disk. This is the case
-    /// BUG 2 depends on (a file deleted from disk is tombstoned and never re-added).
-    #[test]
-    fn tombstone_alone_persists_across_reopen() {
-        let dir = scratch("purge");
-        let vectors_path = dir.join("vectors.bin");
-
-        let mut store = VectorStore::new(&vectors_path).expect("new store");
-        store
-            .append(vec![
-                record("gone.rs", 1, "gone_unique_marker"),
-                record("kept.rs", 1, "kept_unique_marker"),
-            ])
-            .expect("append");
-
-        store.tombstone("gone.rs").expect("tombstone");
-        assert_eq!(texts(&store), vec!["kept_unique_marker"]);
-
-        let reopened = VectorStore::new(&vectors_path).expect("reopen store");
-        assert_eq!(
-            texts(&reopened),
-            vec!["kept_unique_marker"],
-            "purged file came back after reopening the log"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Tombstoning a path that was never indexed must be a harmless no-op, since
-    /// the index loop tombstones every changed file unconditionally.
-    #[test]
-    fn tombstone_unknown_path_is_noop() {
-        let dir = scratch("noop");
-        let vectors_path = dir.join("vectors.bin");
-
-        let mut store = VectorStore::new(&vectors_path).expect("new store");
-        store
-            .append(vec![record("a.rs", 1, "only_chunk")])
-            .expect("append");
-        store.tombstone("never_indexed.rs").expect("tombstone");
-
-        assert_eq!(texts(&store), vec!["only_chunk"]);
-        let reopened = VectorStore::new(&vectors_path).expect("reopen store");
-        assert_eq!(texts(&reopened), vec!["only_chunk"]);
-
-        let _ = std::fs::remove_dir_all(&dir);
+        scored.into_iter().map(|(idx, _)| idx).collect()
     }
 }

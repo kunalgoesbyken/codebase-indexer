@@ -1,4 +1,11 @@
 /target
 .indexer/
-models/model_int8.onnx
+models/*.onnx
 .firecrawl/
+.claude/settings.local.json
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+.env

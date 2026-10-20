@@ -1,318 +1,200 @@
 use crate::types::Chunk;
 use anyhow::Result;
-use std::collections::HashMap;
 use std::path::Path;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Language, Node, Parser, Range};
 
-type NodeKindMap = HashMap<&'static str, Vec<&'static str>>;
+const MAX_CHUNK_CHARS: usize = 3000;
+const MAX_SPLIT_DEPTH: usize = 32;
 
-const MAX_CHUNK_TOKENS: usize = 1000;
-
-fn language_node_kinds() -> NodeKindMap {
-    let mut m = NodeKindMap::new();
-    m.insert("rust", vec!["function_item", "impl_item", "struct_item", "trait_item"]);
-    m.insert("go", vec!["function_declaration", "method_declaration", "type_declaration", "struct_type"]);
-    m.insert("python", vec!["function_definition", "class_definition", "decorated_definition"]);
-    m.insert("typescript", vec!["function_declaration", "class_declaration", "method_definition", "interface_declaration", "type_alias_declaration", "enum_declaration", "arrow_function"]);
-    m.insert("tsx", vec!["function_declaration", "class_declaration", "method_definition", "interface_declaration", "type_alias_declaration", "enum_declaration", "arrow_function"]);
-    m.insert("java", vec!["method_declaration", "class_declaration", "interface_declaration", "enum_declaration", "constructor_declaration"]);
-    m.insert("cpp", vec!["function_definition", "class_specifier", "struct_specifier", "namespace_definition", "template_declaration"]);
-    m
+enum Format {
+    Code(&'static str),
+    Markdown,
+    Config,
 }
 
-fn language_splittable_kinds() -> NodeKindMap {
-    let mut m = NodeKindMap::new();
-    m.insert("rust", vec!["function_item"]);
-    m.insert("go", vec!["function_declaration", "method_declaration"]);
-    m.insert("python", vec!["function_definition", "class_definition"]);
-    m.insert("typescript", vec!["function_declaration", "method_definition"]);
-    m.insert("tsx", vec!["function_declaration", "method_definition"]);
-    m.insert("java", vec!["method_declaration", "constructor_declaration"]);
-    m.insert("cpp", vec!["function_definition"]);
-    m
+fn format_for_path(path: &Path) -> Option<Format> {
+    let format = match path.extension()?.to_str()? {
+        "rs" => Format::Code("rust"),
+        "go" => Format::Code("go"),
+        "py" => Format::Code("python"),
+        "ts" => Format::Code("typescript"),
+        "tsx" => Format::Code("tsx"),
+        "java" => Format::Code("java"),
+        "cpp" | "cxx" | "cc" | "hpp" | "h" | "c" => Format::Code("cpp"),
+        "md" => Format::Markdown,
+        "toml" | "yaml" | "yml" | "json" => Format::Config,
+        _ => return None,
+    };
+    Some(format)
 }
 
-fn language_inner_kinds() -> NodeKindMap {
-    let mut m = NodeKindMap::new();
-    m.insert("rust", vec![
-        "expression_statement",
-        "let_declaration",
-        "return_expression",
-        "match_expression",
-        "for_expression",
-        "while_expression",
-        "loop_expression",
-        "if_expression",
-        "unsafe_block",
-        "macro_invocation",
-    ]);
-    m.insert("go", vec![
-        "expression_statement",
-        "short_var_declaration",
-        "if_statement",
-        "for_statement",
-        "switch_statement",
-        "return_statement",
-        "assignment_statement",
-        "defer_statement",
-        "go_statement",
-    ]);
-    m.insert("python", vec![
-        "expression_statement",
-        "simple_statement",
-        "if_statement",
-        "for_statement",
-        "while_statement",
-        "try_statement",
-        "with_statement",
-        "return_statement",
-        "assignment",
-        "decorated_definition",
-    ]);
-    m.insert("typescript", vec![
-        "expression_statement",
-        "variable_declaration",
-        "if_statement",
-        "for_statement",
-        "while_statement",
-        "try_statement",
-        "return_statement",
-        "switch_statement",
-        "throw_statement",
-        "lexical_declaration",
-    ]);
-    m.insert("tsx", vec![
-        "expression_statement",
-        "variable_declaration",
-        "if_statement",
-        "for_statement",
-        "while_statement",
-        "try_statement",
-        "return_statement",
-        "switch_statement",
-        "throw_statement",
-        "lexical_declaration",
-    ]);
-    m.insert("java", vec![
-        "expression_statement",
-        "if_statement",
-        "for_statement",
-        "while_statement",
-        "try_statement",
-        "return_statement",
-        "switch_statement",
-        "throw_statement",
-        "local_variable_declaration",
-        "assert_statement",
-    ]);
-    m.insert("cpp", vec![
-        "expression_statement",
-        "declaration_statement",
-        "if_statement",
-        "for_statement",
-        "while_statement",
-        "return_statement",
-        "switch_statement",
-        "try_statement",
-        "throw_statement",
-        "preproc_ifdef",
-    ]);
-    m
+fn grammar(lang: &str) -> Option<Language> {
+    let language = match lang {
+        "rust" => tree_sitter_rust::LANGUAGE,
+        "go" => tree_sitter_go::LANGUAGE,
+        "python" => tree_sitter_python::LANGUAGE,
+        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+        "tsx" => tree_sitter_typescript::LANGUAGE_TSX,
+        "java" => tree_sitter_java::LANGUAGE,
+        "cpp" => tree_sitter_cpp::LANGUAGE,
+        _ => return None,
+    };
+    Some(language.into())
 }
 
-fn language_for_path(path: &Path) -> Option<&'static str> {
-    match path.extension()?.to_str()? {
-        "rs" => Some("rust"),
-        "go" => Some("go"),
-        "py" => Some("python"),
-        "ts" => Some("typescript"),
-        "tsx" => Some("tsx"),
-        "java" => Some("java"),
-        "cpp" | "cxx" | "cc" | "hpp" | "h" | "c" => Some("cpp"),
-        "md" => Some("markdown"),
-        "toml" => Some("config"),
-        "yaml" | "yml" => Some("config"),
-        "json" => Some("config"),
-        _ => None,
+fn chunk_kinds(lang: &str) -> &'static [&'static str] {
+    match lang {
+        "rust" => &["function_item", "impl_item", "struct_item", "enum_item", "trait_item"],
+        "go" => &["function_declaration", "method_declaration", "type_declaration"],
+        "python" => &["function_definition", "class_definition", "decorated_definition"],
+        "typescript" | "tsx" => &[
+            "function_declaration",
+            "class_declaration",
+            "interface_declaration",
+            "type_alias_declaration",
+            "enum_declaration",
+            "lexical_declaration",
+        ],
+        "java" => &["class_declaration", "interface_declaration", "enum_declaration", "record_declaration"],
+        "cpp" => &["function_definition", "class_specifier", "struct_specifier", "namespace_definition", "template_declaration"],
+        _ => &[],
     }
 }
 
-fn estimate_tokens(text: &str) -> usize {
-    text.split_whitespace().count()
+fn chunk_size(text: &str) -> usize {
+    text.chars().filter(|c| !c.is_whitespace()).count()
 }
 
-fn make_chunk(node: Node, source: &str, rel_path: &str) -> Chunk {
+fn split_to_budget(node: Node, source: &str, depth: usize) -> Vec<Range> {
+    let fits = chunk_size(&source[node.byte_range()]) <= MAX_CHUNK_CHARS;
+    if fits || node.child_count() == 0 || depth >= MAX_SPLIT_DEPTH {
+        return vec![node.range()];
+    }
+    let mut cursor = node.walk();
+    let pieces = node
+        .children(&mut cursor)
+        .flat_map(|child| split_to_budget(child, source, depth + 1))
+        .collect();
+    merge_adjacent(pieces, source)
+}
+
+fn merge_adjacent(pieces: Vec<Range>, source: &str) -> Vec<Range> {
+    let mut merged: Vec<Range> = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        if let Some(last) = merged.last_mut()
+            && chunk_size(&source[last.start_byte..piece.end_byte]) <= MAX_CHUNK_CHARS
+        {
+            last.end_byte = piece.end_byte;
+            last.end_point = piece.end_point;
+            continue;
+        }
+        merged.push(piece);
+    }
+    merged
+}
+
+fn collect_ranges(root: Node, source: &str, kinds: &[&str]) -> Vec<Range> {
+    let mut ranges = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if kinds.contains(&node.kind()) {
+            ranges.extend(split_to_budget(node, source, 0));
+            continue;
+        }
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+    ranges
+}
+
+fn range_chunk(range: &Range, source: &str, rel_path: &str) -> Chunk {
     Chunk {
         file_path: rel_path.to_string(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-        text: source[node.start_byte()..node.end_byte()].to_string(),
+        start_line: range.start_point.row + 1,
+        end_line: range.end_point.row + 1,
+        text: source[range.start_byte..range.end_byte].to_string(),
     }
 }
 
-fn split_node(node: Node, source: &str, inner_kinds: &[&str], rel_path: &str, depth: usize) -> Vec<Chunk> {
-    if depth > 5 {
-        return vec![make_chunk(node, source, rel_path)];
+fn chunk_code(lang: &str, source: &str, rel_path: &str) -> Result<Vec<Chunk>> {
+    let language = grammar(lang).ok_or_else(|| anyhow::anyhow!("no grammar for language: {lang}"))?;
+    let mut parser = Parser::new();
+    parser.set_language(&language)?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow::anyhow!("failed to parse {rel_path}"))?;
+
+    let root = tree.root_node();
+    let mut ranges = collect_ranges(root, source, chunk_kinds(lang));
+    if ranges.is_empty() && !source.trim().is_empty() {
+        ranges = split_to_budget(root, source, 0);
     }
-    let text = &source[node.start_byte()..node.end_byte()];
-    if estimate_tokens(text) <= MAX_CHUNK_TOKENS || inner_kinds.is_empty() {
-        return vec![make_chunk(node, source, rel_path)];
-    }
-    let mut result = Vec::new();
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if inner_kinds.contains(&child.kind()) {
-            result.extend(split_node(child, source, inner_kinds, rel_path, depth + 1));
-        }
-    }
-    if result.is_empty() {
-        result.push(make_chunk(node, source, rel_path));
-    }
-    result
+    Ok(ranges.iter().map(|r| range_chunk(r, source, rel_path)).collect())
 }
 
-fn collect_chunks(
-    node: Node,
-    source: &str,
-    kinds: &[&str],
-    splittable_kinds: &[&str],
-    inner_kinds: &[&str],
-    rel_path: &str,
-) -> Vec<Chunk> {
+fn is_markdown_heading(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let after_hashes = trimmed.trim_start_matches('#');
+    trimmed.starts_with('#') && (after_hashes.is_empty() || after_hashes.starts_with(char::is_whitespace))
+}
+
+fn is_code_fence(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+fn push_lines(chunks: &mut Vec<Chunk>, lines: &[&str], start_line: usize, rel_path: &str) {
+    let text = lines.join("\n");
+    if text.trim().is_empty() {
+        return;
+    }
+    chunks.push(Chunk {
+        file_path: rel_path.to_string(),
+        start_line,
+        end_line: start_line + lines.len() - 1,
+        text,
+    });
+}
+
+fn chunk_lines(source: &str, rel_path: &str, mut starts_section: impl FnMut(&str) -> bool) -> Vec<Chunk> {
     let mut chunks = Vec::new();
-    if kinds.contains(&node.kind()) {
-        let text = &source[node.start_byte()..node.end_byte()];
-        let is_splittable = splittable_kinds.contains(&node.kind());
-        if is_splittable && estimate_tokens(text) > MAX_CHUNK_TOKENS && !inner_kinds.is_empty() {
-            chunks.extend(split_node(node, source, inner_kinds, rel_path, 0));
-        } else {
-            chunks.push(make_chunk(node, source, rel_path));
+    let mut current: Vec<&str> = Vec::new();
+    let mut current_size = 0;
+    let mut start_line = 1;
+
+    for (i, line) in source.lines().enumerate() {
+        let line_size = chunk_size(line);
+        let overflows = current_size + line_size > MAX_CHUNK_CHARS;
+        if starts_section(line) || overflows {
+            push_lines(&mut chunks, &current, start_line, rel_path);
+            current.clear();
+            current_size = 0;
+            start_line = i + 1;
         }
+        current.push(line);
+        current_size += line_size;
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        chunks.extend(collect_chunks(child, source, kinds, splittable_kinds, inner_kinds, rel_path));
-    }
+    push_lines(&mut chunks, &current, start_line, rel_path);
     chunks
 }
 
 fn chunk_markdown(source: &str, rel_path: &str) -> Vec<Chunk> {
-    let mut chunks = Vec::new();
-    let mut current_lines: Vec<String> = Vec::new();
-    let mut current_start = 1;
-
-    for (i, line) in source.lines().enumerate() {
-        let line_num = i + 1;
-        if line.starts_with('#') && !current_lines.is_empty() {
-            let text = current_lines.join("\n");
-            if !text.trim().is_empty() {
-                chunks.push(Chunk {
-                    file_path: rel_path.to_string(),
-                    start_line: current_start,
-                    end_line: line_num - 1,
-                    text,
-                });
-            }
-            current_start = line_num;
-            current_lines.clear();
+    let mut in_fence = false;
+    chunk_lines(source, rel_path, |line| {
+        if is_code_fence(line) {
+            in_fence = !in_fence;
         }
-        current_lines.push(line.to_string());
-    }
-
-    if !current_lines.is_empty() {
-        let text = current_lines.join("\n");
-        if !text.trim().is_empty() {
-            chunks.push(Chunk {
-                file_path: rel_path.to_string(),
-                start_line: current_start,
-                end_line: source.lines().count(),
-                text,
-            });
-        }
-    }
-
-    if chunks.is_empty() && !source.trim().is_empty() {
-        chunks.push(Chunk {
-            file_path: rel_path.to_string(),
-            start_line: 1,
-            end_line: source.lines().count(),
-            text: source.to_string(),
-        });
-    }
-
-    chunks
-}
-
-fn whole_file_chunk(source: &str, rel_path: &str) -> Vec<Chunk> {
-    if source.trim().is_empty() {
-        return Vec::new();
-    }
-    vec![Chunk {
-        file_path: rel_path.to_string(),
-        start_line: 1,
-        end_line: source.lines().count(),
-        text: source.to_string(),
-    }]
+        !in_fence && is_markdown_heading(line)
+    })
 }
 
 pub fn chunk_file_with_rel(path: &Path, source: &str, rel_path: &str) -> Result<Vec<Chunk>> {
-    let lang = language_for_path(path)
+    let format = format_for_path(path)
         .ok_or_else(|| anyhow::anyhow!("unsupported language: {}", path.display()))?;
-
-    if lang == "markdown" {
-        return Ok(chunk_markdown(source, rel_path));
+    match format {
+        Format::Code(lang) => chunk_code(lang, source, rel_path),
+        Format::Markdown => Ok(chunk_markdown(source, rel_path)),
+        Format::Config => Ok(chunk_lines(source, rel_path, |_| false)),
     }
-
-    if lang == "config" {
-        return Ok(whole_file_chunk(source, rel_path));
-    }
-
-    let kinds_map = language_node_kinds();
-    let kinds = kinds_map.get(lang).ok_or_else(|| {
-        anyhow::anyhow!("no node kinds defined for language: {lang}")
-    })?;
-
-    let splittable_map = language_splittable_kinds();
-    let splittable_kinds = splittable_map.get(lang).map(|v| &v[..]).unwrap_or(&[]);
-
-    let inner_map = language_inner_kinds();
-    let inner_kinds = inner_map.get(lang).map(|v| &v[..]).unwrap_or(&[]);
-
-    let mut parser = Parser::new();
-
-    let tree_lang: tree_sitter::Language = match lang {
-        "rust" => tree_sitter_rust::LANGUAGE.into(),
-        "go" => tree_sitter_go::LANGUAGE.into(),
-        "python" => tree_sitter_python::LANGUAGE.into(),
-        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        "java" => tree_sitter_java::LANGUAGE.into(),
-        "cpp" => tree_sitter_cpp::LANGUAGE.into(),
-        _ => unreachable!(),
-    };
-    parser.set_language(&tree_lang)?;
-
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| anyhow::anyhow!("failed to parse {}", path.display()))?;
-
-    let root = tree.root_node();
-    let mut chunks = collect_chunks(root, source, kinds, splittable_kinds, inner_kinds, rel_path);
-
-    for chunk in &mut chunks {
-        if chunk.file_path.is_empty() {
-            chunk.file_path = rel_path.to_string();
-        }
-    }
-
-    if chunks.is_empty() {
-        chunks.push(Chunk {
-            file_path: rel_path.to_string(),
-            start_line: 1,
-            end_line: source.lines().count(),
-            text: source.to_string(),
-        });
-    }
-
-    Ok(chunks)
 }

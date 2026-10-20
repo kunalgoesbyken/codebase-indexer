@@ -2,58 +2,54 @@ use crate::types::FileState;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
-pub fn file_hash(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+pub fn rel_path(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string()
+}
+
+fn file_state(path: &Path, rel: String) -> Result<FileState> {
+    let hash = format!("{:x}", Sha256::digest(std::fs::read(path)?));
+    let last_modified = std::fs::metadata(path)?
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok(FileState { path: rel, hash, last_modified })
 }
 
 pub fn load_cache(cache_path: &Path) -> Result<HashMap<String, FileState>> {
     if !cache_path.exists() {
         return Ok(HashMap::new());
     }
-    let bytes = std::fs::read(cache_path)?;
-    let states: Vec<FileState> = bincode::deserialize(&bytes)?;
+    let states: Vec<FileState> = bincode::deserialize(&std::fs::read(cache_path)?)?;
     Ok(states.into_iter().map(|s| (s.path.clone(), s)).collect())
 }
 
-pub fn save_cache(cache_path: &Path, states: &[FileState]) -> Result<()> {
+pub fn save_cache(cache_path: &Path, cache: &HashMap<String, FileState>) -> Result<()> {
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let bytes = bincode::serialize(states)?;
-    std::fs::write(cache_path, bytes)?;
+    let states: Vec<&FileState> = cache.values().collect();
+    std::fs::write(cache_path, bincode::serialize(&states)?)?;
     Ok(())
 }
 
 pub fn detect_changes(
-    files: &[std::path::PathBuf],
+    files: &[PathBuf],
     cache: &HashMap<String, FileState>,
     root: &Path,
-) -> Result<Vec<std::path::PathBuf>> {
+) -> Result<Vec<(PathBuf, FileState)>> {
     let mut changed = Vec::new();
     for path in files {
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
-        let hash = file_hash(path)?;
-        let modified = std::fs::metadata(path)?.modified()?;
-        let mtime = modified
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let needs_update = cache.get(&rel).map_or(true, |cached| {
-            cached.hash != hash || cached.last_modified != mtime
-        });
-        if needs_update {
-            changed.push(path.to_path_buf());
+        let state = file_state(path, rel_path(path, root))?;
+        let is_unchanged = cache
+            .get(&state.path)
+            .is_some_and(|cached| cached.hash == state.hash && cached.last_modified == state.last_modified);
+        if !is_unchanged {
+            changed.push((path.clone(), state));
         }
     }
     Ok(changed)
 }
-
